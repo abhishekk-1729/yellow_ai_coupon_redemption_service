@@ -30,11 +30,15 @@ class JsonFormatter(logging.Formatter):
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
-            "correlation_id": get_correlation_id(),
+            # Stamped by CorrelationIdFilter when the record was emitted. The
+            # context variable is only a fallback, for records logged outside a
+            # request or by a handler with no filter attached.
+            "correlation_id": getattr(record, "correlation_id", "")
+            or get_correlation_id(),
         }
 
         for key, value in record.__dict__.items():
-            if key not in _RESERVED_RECORD_KEYS:
+            if key not in _RESERVED_RECORD_KEYS and key != "correlation_id":
                 payload[key] = value
 
         if record.exc_info:

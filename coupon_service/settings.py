@@ -136,6 +136,11 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "filters": {
+        "correlation_id": {
+            "()": "redemption.observability.correlation.CorrelationIdFilter",
+        },
+    },
     "formatters": {
         "json": {"()": "redemption.observability.formatter.JsonFormatter"},
     },
@@ -143,6 +148,7 @@ LOGGING = {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "json",
+            "filters": ["correlation_id"],
         },
     },
     "root": {"handlers": ["console"], "level": LOG_LEVEL},
@@ -150,6 +156,16 @@ LOGGING = {
         "redemption": {
             "handlers": ["console"],
             "level": LOG_LEVEL,
+            "propagate": False,
+        },
+        # Django logs every 4xx a second time from BaseHandler.get_response,
+        # which runs after the correlation-id middleware has already unwound --
+        # so that duplicate carries no correlation id and cannot be traced.
+        # Business rejections are logged with full context by the exception
+        # handler; leave this at ERROR so only genuine 500s come through here.
+        "django.request": {
+            "handlers": ["console"],
+            "level": "ERROR",
             "propagate": False,
         },
     },

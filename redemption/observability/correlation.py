@@ -1,5 +1,6 @@
 """Correlation id propagation across a request's log records."""
 
+import logging
 import uuid
 from contextvars import ContextVar
 from typing import Callable
@@ -27,6 +28,30 @@ def set_correlation_id(correlation_id: str) -> None:
         correlation_id: Identifier to associate with subsequent log records.
     """
     _correlation_id.set(correlation_id)
+
+
+class CorrelationIdFilter(logging.Filter):
+    """Stamps the active correlation id onto every record as it is emitted.
+
+    Resolving the id when the record is *created* rather than when it is
+    formatted keeps it correct even if formatting is deferred to another thread
+    or process, as it would be behind a ``QueueHandler`` or an async log
+    shipper. Reading the context variable in the formatter instead would
+    silently yield an empty id in those setups.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Attach the correlation id to a record.
+
+        Args:
+            record: Record about to be handled.
+
+        Returns:
+            True always; this filter enriches rather than excludes.
+        """
+        if not hasattr(record, "correlation_id"):
+            record.correlation_id = get_correlation_id()
+        return True
 
 
 class CorrelationIdMiddleware:

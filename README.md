@@ -149,6 +149,166 @@ exactly the rounding error the service avoids everywhere else.
 is *derived* from it and the coupon percentage, so the two cannot drift apart and
 cancellation needs no monetary reversal.
 
+## Debugging: what to look at when something goes wrong
+
+### The logs
+
+Every record is one line of JSON on stdout, carrying a `correlation_id` and the
+identifiers needed to act on it. A real failure looks like this:
+
+```json
+{"timestamp": "2026-09-07T07:04:08.791654+00:00", "level": "WARNING",
+ "logger": "redemption.api.exception_handler",
+ "message": "request failed: Coupon is not redeemable because no redemptions are left.",
+ "correlation_id": "trace-demo-42", "error_code": "COUPON_EXHAUSTED",
+ "coupon_code": "SAVE20", "customer_id": 3, "redeemed_count": 1, "max_redemptions": 1}
+```
+
+Note what is *not* there: no "an error occurred". Every failure names the code,
+the coupon, the customer and the counts that caused it, so you can act without
+reproducing it.
+
+**Tracing one request.** Send `X-Correlation-Id: <anything>` and it is used for
+every log line that request produces, and echoed back on the response. Send
+nothing and a UUID4 is generated. Either way the response header tells you the
+id to grep for:
+
+```bash
+curl -i -H 'X-Correlation-Id: trace-42' ... # then: grep trace-42 app.log
+```
+
+The id is stamped onto the record when it is **emitted**, not when it is
+formatted, so it stays correct behind a `QueueHandler` or an async log shipper.
+
+**One failure produces exactly one record.** Django logs every 4xx a second time
+from `BaseHandler.get_response`, which runs *after* the correlation-id
+middleware has unwound — so that duplicate carries an empty id and cannot be
+traced. `django.request` is pinned to `ERROR` to suppress it; genuine 500s still
+come through. There is a test asserting this.
+
+**Useful filters** (`LOG_LEVEL=INFO` gives you the successes too):
+
+```bash
+grep '"error_code"'                 app.log   # every rejection
+grep '"message": "coupon redeemed"' app.log   # every successful redemption
+grep '"replayed": true'             app.log   # idempotent retries
+jq -c 'select(.error_code=="COUPON_EXHAUSTED")' app.log
+```
+
+Set `LOG_LEVEL=WARNING` in production if the per-redemption INFO lines are too
+chatty; every failure is still logged.
+
+### Reading the error codes
+
+The error code tells you where to look. These are business rejections, not bugs:
+
+| Seeing a lot of | Means | Check |
+|---|---|---|
+| `COUPON_EXHAUSTED` | Cap reached — working as designed | `GET /coupons/:code`; is the cap right? |
+| `CUSTOMER_ALREADY_REDEEMED` | STANDARD coupon reused | Should it be STACKABLE? |
+| `ORDER_ALREADY_HAS_COUPON` | Client retried with a *different* coupon | Client bug: it is reusing `order_id` |
+| `ORDER_NOT_PLACED` | Redeem after cancel | Client is not re-creating the order |
+| `IDEMPOTENCY_KEY_MISMATCH` | Header ≠ `order_id` | Client is generating its own key |
+| `VALIDATION_ERROR` | Rejected at the boundary | `error.context.fields` names the field |
+
+A `500` is different — that *is* a bug. It will carry a stack trace and a
+correlation id; grep the id to see the request that caused it.
+
+### Auditing the invariant directly
+
+The counter should always equal the number of live orders holding the coupon.
+This query returns **zero rows** on a healthy system — any row is real drift:
+
+```sql
+SELECT c.code, c.redeemed_count, c.max_redemptions,
+       count(o.id) FILTER (WHERE o.status = 'PLACED') AS live_orders,
+       c.redeemed_count - count(o.id) FILTER (WHERE o.status = 'PLACED') AS drift
+FROM coupons c LEFT JOIN orders o ON o.coupon_id = c.id
+GROUP BY c.id, c.code, c.redeemed_count, c.max_redemptions
+HAVING c.redeemed_count <> count(o.id) FILTER (WHERE o.status = 'PLACED');
+```
+
+```sql
+-- Over cap. Cannot happen: the check constraint rejects it at write time.
+-- If this ever returns a row, the constraint was dropped.
+SELECT code, redeemed_count, max_redemptions FROM coupons
+WHERE redeemed_count > max_redemptions;
+
+-- STANDARD coupon used twice by one customer. The partial unique index
+-- prevents it; a row here means the index is missing.
+SELECT coupon_id, user_id, count(*) FROM orders
+WHERE is_single_use AND status = 'PLACED'
+GROUP BY coupon_id, user_id HAVING count(*) > 1;
+```
+
+Confirm the guards are actually installed:
+
+```sql
+\d+ coupons   -- expect: coupon_redeemed_within_cap
+\d+ orders    -- expect: uniq_standard_coupon_active_per_user
+```
+
+### Slow or hanging redemptions
+
+Every redemption of a given coupon serialises on that coupon's row. That is
+deliberate — it is what makes the cap exact — but it means a hot coupon is a
+queue, and a long transaction upstream stalls everyone behind it.
+
+```sql
+-- Who is waiting on a lock right now
+SELECT pid, wait_event_type, wait_event, state,
+       now() - query_start AS waiting_for, left(query, 60) AS query
+FROM pg_stat_activity
+WHERE datname = 'coupons' AND wait_event_type = 'Lock';
+
+-- Who is blocking whom
+SELECT pid, pg_blocking_pids(pid) AS blocked_by, left(query, 60) AS query
+FROM pg_stat_activity WHERE cardinality(pg_blocking_pids(pid)) > 0;
+
+-- The usual culprit: a transaction left open
+SELECT pid, state, now() - xact_start AS txn_age, left(query, 60) AS query
+FROM pg_stat_activity
+WHERE datname = 'coupons' AND state = 'idle in transaction'
+ORDER BY xact_start;
+```
+
+**Deadlocks should stay at zero**, because redemption and cancellation both take
+the order lock before the coupon lock. A non-zero count means something new is
+taking them in the other order:
+
+```sql
+SELECT deadlocks FROM pg_stat_database WHERE datname = 'coupons';
+```
+
+Postgres logs the two conflicting statements when it breaks a deadlock — that
+log tells you exactly which code path violated the ordering.
+
+### Symptom → cause
+
+| Symptom | Likely cause | Confirm |
+|---|---|---|
+| `redeemed_count` exceeds the cap | Check constraint dropped | `\d+ coupons` |
+| Count drifts from live orders | A write bypassed the service layer | The drift query above |
+| Redeems hang, then time out | Long transaction holding the coupon row | `idle in transaction` query |
+| Deadlock errors | New code taking locks out of order | `pg_stat_database.deadlocks` |
+| Same order charged twice | Would mean the order lock failed | Should be impossible; check `orders.id` is still the PK |
+| Cancel refunds twice | Would mean the status guard failed | Check `orders.status` before/after |
+| Logs have no `correlation_id` | Filter not attached to your handler | `LOGGING["handlers"]` in settings |
+| Money off by a cent | Something reintroduced floats | Values must render as `"800.00"`, not `800.0` |
+
+### Reproducing a concurrency problem
+
+The load tests are the fastest way to tell whether a change broke the guarantees:
+
+```bash
+.venv/bin/pytest tests/test_load_multiprocess.py -v   # two real OS processes
+.venv/bin/pytest tests/test_concurrency_threads.py -v # 50 threads, 10 slots
+```
+
+If these pass but production still oversells, the difference is environmental —
+check that the check constraint and partial index exist in *that* database, and
+that migrations were actually applied.
+
 ## Architecture
 
 ```
@@ -216,7 +376,7 @@ These are judgement calls; all are reversible.
 
 ## Test coverage
 
-68 tests, every invariant covered in both its happy and failing direction.
+76 tests, every invariant covered in both its happy and failing direction.
 
 - **Sanity** — discount arithmetic, half-up rounding, parts reconciling against
   the original, money never a float.
@@ -232,6 +392,9 @@ These are judgement calls; all are reversible.
   cancels never going negative, the freed slot genuinely reusable.
 - **Load, threads** — 50 threads chasing 10 slots; a reader sampling throughout;
   interleaved redeem/cancel traffic.
+- **Observability** — the JSON formatter surviving an unserialisable `extra=`,
+  the correlation id reaching the log line, and one failure producing exactly
+  one record rather than an untraceable duplicate.
 - **Load, processes** — two spawned OS processes racing for a fixed cap, an
   assertion that **both** processes win slots (otherwise they never overlapped
   and the test proved nothing), a redeem process racing a cancel process, and a
